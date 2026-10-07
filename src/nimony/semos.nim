@@ -758,15 +758,40 @@ proc runPlugin*(c: var SemContext; dest: var TokenBuf; info: NifLineInfo;
   var noAdditional = nifcore.createTokenBuf(1)
   runPlugin(c, dest, info, pluginName, input, noAdditional)
 
+proc nativeEval*(c: SemContext): bool =
+  ## True when the outer compile targets the libc-free native backend, so the
+  ## compile-time evaluator should be built with arkham + nifasm too.
+  ##
+  ## This cannot be read off `c.g.config.backend`: only `nimony` ever sets that
+  ## (in its `n` command / `--native` option), while the evaluator runs inside
+  ## `nimsem`, whose config keeps the default `backendC`. The backend therefore
+  ## has to be recognized from a define — and `nimNoLibc` is precisely the one
+  ## `nimony` forwards for this target ("the TRULY freestanding target — the
+  ## native (arkham+nifasm) backend", see the `nativeBackend` branch in
+  ## `nimony.nim`). It reaches nimsem through `commandLineArgs`.
+  ##
+  ## Linux's `-d:useLibc` native build is the one case this misses: it links
+  ## libc, so nimony does not set `nimNoLibc`, and the evaluator stays on the C
+  ## backend. That build is not C-free anyway — the native path there hands the
+  ## link to the system linker.
+  c.g.config.isDefined("nimNoLibc")
+
 proc runProgram(file: string; nimcachePath: string; usedModules: HashSet[string];
                 commandLineArgs: string;
-                sourceDir = ""): tuple[output: string, exitCode: int] =
+                sourceDir = ""; native = false): tuple[output: string, exitCode: int] =
   # Compile the .p.nif through the full pipeline, then run the resulting
   # binary. Compilation must keep the outer cwd (nimcache paths are relative
   # to the invoking compile). Only the execution step uses `workingDir` so
   # relative paths like `doc/version.md` resolve next to the caller module.
+  #
+  # `native` builds the evaluator with arkham + nifasm instead of the C backend,
+  # so a native compile (`nimony n`) stays C-free end to end. Without it every
+  # `const` that needs evaluation dragged a C compiler back in. The flag is
+  # `--native` — the one `s` already accepts for macro-plugin compilation — and
+  # the evaluator then lands in the `n` backend directory instead of `c`.
   let nimonyExe = findTool("nimony")
   let compileCmd = quoteShell(nimonyExe) & commandLineArgs &
+    (if native: " --native" else: "") &
     " --nimcache:" & quoteShell(nimcachePath) &
     " s " & quoteShell(file)
   try:
@@ -776,7 +801,8 @@ proc runProgram(file: string; nimcachePath: string; usedModules: HashSet[string]
   if result.exitCode != 0: return
 
   let modname = extractModuleSuffix(file)
-  let exe = nimcachePath / BackendDirC / modname / splitFile(file).name.addFileExt(ExeExt)
+  let exe = nimcachePath / (if native: BackendDirNative else: BackendDirC) /
+            modname / splitFile(file).name.addFileExt(ExeExt)
   # The child may start in `sourceDir`; keep the exe path absolute so it
   # still resolves against the outer compile's cwd, not the module dir.
   var exeToRun = exe
@@ -803,9 +829,17 @@ proc buildWriteNifModule(c: var SemContext): string =
   # fails because the outer nimsem (currently paused waiting on this exec)
   # still has it mmap'd. The outer's args live on `c.commandLineArgs`.
   let nimonyExe = findTool("nimony")
+  # Follow the outer compile's backend: a native compile must not drag the C
+  # compiler in here either. This is the `std/writenif` prebuild the evaluator
+  # links against and it is the *other* C user in the eval path — in a native
+  # boot of the toolchain every one of the measured 228 `clang` invocations was
+  # a module of this build. The `.s.nif` it produces lands at the nimcache root
+  # either way (which is what `prepareEval` waits on); only the backend directory
+  # differs, so the evaluator built by `runProgram` finds it under the same one.
+  let backendCmd = if nativeEval(c): " n " else: " c "
   let cmd = quoteShell(nimonyExe) & c.commandLineArgs &
     " --nimcache:" & quoteShell(c.g.config.nifcachePath) &
-    " c " & quoteShell(stdlibFile("std/writenif.nim"))
+    backendCmd & quoteShell(stdlibFile("std/writenif.nim"))
   try:
     let (output, exitCode) = execCmdEx(cmd)
     result = if exitCode != 0: output else: ""
@@ -855,7 +889,8 @@ proc runEval*(c: var SemContext; dest: var TokenBuf; srcName: string; src: Token
     let depsFile = c.g.config.nifcachePath / srcName & ".p.deps.nif"
     writeFile(depsFile, toString(deps, true))
     let (output, exitCode) = runProgram(progfile, c.g.config.nifcachePath, usedModules,
-                                        c.commandLineArgs, sourceDir)
+                                        c.commandLineArgs, sourceDir,
+                                        native = nativeEval(c))
     if exitCode != 0:
       result = ensureMove(output)
     else:
