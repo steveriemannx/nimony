@@ -103,13 +103,25 @@ proc useNativeBoot*(): bool =
   ## fixed `--boot-backend:native` reaches the byte-identical stage1==stage2==stage3
   ## fixed point in ~245s on an M-series laptop.
   ##
+  ## freebsd/amd64 is in as of this change. What had kept it out was one nifasm bug
+  ## in the x86-64 entry stub: it read `argc` from `(%rsp)`, the Linux convention,
+  ## while FreeBSD enters the image with the argument block pointer in `%rdi` — what
+  ## crt1.o reads — and pads `%rsp` with a zero word whenever the alignment it wants
+  ## requires one. So the stub saw argc == 0 on some runs and `paramCount()` returned
+  ## -1, which made every stage-2 tool die with "too few command line arguments" (and
+  ## made it look like a race, since the padding depends on the randomized stack
+  ## address). Fixed in nativenif's `setupX64ArgsEntry`
+  ## (`src/nifasm/driver.nim`); a native boot now reaches the byte-identical
+  ## stage1==stage2==stage3 fixed point in ~50s, against ~111s through the C backend.
+  ##
   ## windows/amd64 is in as of #2325: arkham's win_x64 target emits a PE that
   ## imports what it needs per dll, so a native boot there needs no MinGW and no
   ## libc — which is what makes the Windows job the slowest in the matrix (601s
   ## of stages against 61s natively).
   when (defined(linux) and (defined(amd64) or defined(arm64))) or
        (defined(windows) and defined(amd64)) or
-       (defined(macosx) and defined(arm64)):
+       (defined(macosx) and defined(arm64)) or
+       (defined(freebsd) and defined(amd64)):
     result = NativeBootReady and missingNativeTools().len == 0
   else:
     result = false
@@ -128,7 +140,8 @@ proc bootBackendLine*(withValgrind: bool): string =
     return result & " — forced by --boot-backend:c"
   when (defined(linux) and (defined(amd64) or defined(arm64))) or
        (defined(windows) and defined(amd64)) or
-       (defined(macosx) and defined(arm64)):
+       (defined(macosx) and defined(arm64)) or
+       (defined(freebsd) and defined(amd64)):
     if withValgrind:
       result.add " — --valgrind cannot see the native heap"
     elif not NativeBootReady:
